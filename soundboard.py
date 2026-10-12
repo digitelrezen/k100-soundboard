@@ -21,6 +21,10 @@ How it works:
     keep the mix inside [-1, 1], so the voice never gets quiet or muffled.
   - pygame (pygame.sndarray) decodes .wav/.mp3/.ogg to float32 stereo.
   - pynput global hotkey listener (F13-F18) in a daemon thread.
+  - Push-to-talk: hold the PTT key (configurable in the GUI) to open the mic
+    path; soundboard triggers are always on. The mic gate ramps over ~10 ms
+    so opening/closing never clicks. Set Discord's input mode to Voice
+    Activity (not Push to Talk) so the cable stream is always transmitted.
 
 Usage:
     python soundboard.py
@@ -48,6 +52,7 @@ from scipy.signal import resample_poly
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOUNDS_DIR = os.path.join(BASE_DIR, "sounds")
 ASSIGNMENTS_FILE = os.path.join(BASE_DIR, "assignments.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 AUDIO_EXTS = {".wav", ".mp3", ".ogg"}
 SLOTS = [f"G{i}" for i in range(1, 7)]
 HOTKEYS = {
@@ -59,6 +64,34 @@ HOTKEYS = {
     "G6": keyboard.Key.f18,
 }
 KEY_TO_SLOT = {key: slot for slot, key in HOTKEYS.items()}
+
+# Push-to-talk key options: (label shown in the GUI, predicate for a pynput
+# key event). Letters arrive as KeyCode with .char; special keys as Key.
+# F13-F18 are taken by the G-Keys, so F1-F12 are free for PTT.
+def _ptt_label(spec: str) -> str:
+    if spec.isalpha() and len(spec) == 1:
+        return spec.upper()
+    if spec == "space":
+        return "Space"
+    if "_" in spec:  # e.g. "shift_l" -> "Left Shift"
+        mod, side = spec.split("_")
+        return f"{side.title()} {mod.title()}"
+    return spec.upper()  # "f1" -> "F1"
+
+
+def _ptt_match(spec: str):
+    if spec.isalpha() and len(spec) == 1:
+        ch = spec.lower()
+        return lambda key: str(getattr(key, "char", "")).lower() == ch
+    target = getattr(keyboard.Key, spec)
+    return lambda key: key == target
+
+
+PTT_KEY_SPECS = (
+    ["v", "b", "n", "m", "space", "shift_l", "shift_r", "ctrl_l", "ctrl_r"]
+    + [f"f{i}" for i in range(1, 13)]
+)
+PTT_KEY_OPTIONS = [(_ptt_label(s), _ptt_match(s)) for s in PTT_KEY_SPECS]
 
 DECODE_RATE = 48000     # rate pygame decodes files at (before resampling)
 ENGINE_RATE = 48000     # fallback engine rate if the cable device's native rate is unknown
@@ -167,6 +200,25 @@ def save_assignments(names: dict[str, str]):
         pass
 
 
+def load_settings() -> dict:
+    """Load app settings (PTT enabled/key) — {} if none or corrupt."""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(data: dict):
+    """Persist app settings (best effort)."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
 def decode_sound(path: str, target_rate: int) -> np.ndarray:
     """Decode an audio file to float32 stereo at target_rate.
 
@@ -251,6 +303,9 @@ class AudioEngine:
         self.decode_rate = ENGINE_RATE  # rate the cached slot arrays are at
         self.mic_gain = 1.0
         self.sb_gain = 1.0
+        self.ptt_enabled = False   # gate the mic behind the PTT key (set by GUI)
+        self.ptt_active = False    # PTT key currently held (set by listener thread)
+        self._mic_gate = 1.0       # smoothed 0..1 mic gate (mixer thread only)
         self.mic_device = None
         self.headphone_device = None
         self.cable_device = None
@@ -368,7 +423,16 @@ class AudioEngine:
         while self._mixing:
             n = BLOCKSIZE
             with self.lock:
-                mix = self.mic_ring.read(n) * self.mic_gain
+                # Push-to-talk gate: ramp toward 0/1 over ~10 ms (click-free).
+                # While PTT is on and the key is not held, the mic is muted but
+                # still captured into the ring, so pressing the key is instant.
+                target = 1.0 if (not self.ptt_enabled or self.ptt_active) else 0.0
+                step = period / 0.010
+                if self._mic_gate < target:
+                    self._mic_gate = min(target, self._mic_gate + step)
+                elif self._mic_gate > target:
+                    self._mic_gate = max(target, self._mic_gate - step)
+                mix = self.mic_ring.read(n) * (self.mic_gain * self._mic_gate)
                 alive = []
                 for player in self.players:
                     buf, pos = player
@@ -462,7 +526,17 @@ class SoundboardApp:
         self._ui_q: queue.Queue = queue.Queue()  # callables for the UI thread
         self._listener: keyboard.Listener | None = None
 
+        # Push-to-talk settings (persisted in settings.json).
+        settings = load_settings()
+        self.ptt_var = tk.BooleanVar(value=bool(settings.get("ptt_enabled", True)))
+        ptt_label = settings.get("ptt_key", PTT_KEY_OPTIONS[0][0])
+        self.ptt_idx = next(
+            (i for i, (lab, _k) in enumerate(PTT_KEY_OPTIONS) if lab == ptt_label), 0
+        )
+        self._ptt_match = PTT_KEY_OPTIONS[self.ptt_idx][1]
+
         self.engine = AudioEngine(status_cb=self._status_q_put)
+        self.engine.ptt_enabled = self.ptt_var.get()
         self._init_mixer()
         if sys.platform == "win32":
             try:
@@ -498,6 +572,31 @@ class SoundboardApp:
         ttk.Label(
             dev_frame, textvariable=self.cable_hint_var, foreground="#0a6", anchor="w"
         ).pack(fill="x", padx=8, pady=(0, 4))
+
+        ptt_frame = ttk.LabelFrame(self.root, text="Push-to-Talk (mic)")
+        ptt_frame.pack(fill="x", **pad)
+        ptt_row = ttk.Frame(ptt_frame)
+        ptt_row.pack(fill="x", padx=8, pady=4)
+        ttk.Checkbutton(
+            ptt_row,
+            text="Mic only while key held",
+            variable=self.ptt_var,
+            command=self._on_ptt_toggle,
+        ).pack(side="left")
+        ttk.Label(ptt_row, text="  Key:").pack(side="left")
+        self.ptt_combo = ttk.Combobox(
+            ptt_row,
+            values=[lab for lab, _k in PTT_KEY_OPTIONS],
+            state="readonly",
+            width=12,
+        )
+        self.ptt_combo.set(PTT_KEY_OPTIONS[self.ptt_idx][0])
+        self.ptt_combo.pack(side="left", padx=4)
+        self.ptt_combo.bind("<<ComboboxSelected>>", self._on_ptt_key)
+        self.ptt_state_var = tk.StringVar(value="")
+        self.ptt_state_label = tk.Label(ptt_row, textvariable=self.ptt_state_var, fg="#888")
+        self.ptt_state_label.pack(side="left", padx=12)
+        self._update_ptt_indicator(False)
 
         gain_frame = ttk.LabelFrame(self.root, text="Gain")
         gain_frame.pack(fill="x", **pad)
@@ -875,13 +974,62 @@ class SoundboardApp:
             slot = KEY_TO_SLOT.get(key)
             if slot is not None:
                 self.engine.trigger(slot)
+            if self._ptt_match(key):
+                self._set_ptt(True)
+
+        def on_release(key):
+            if self._ptt_match(key):
+                self._set_ptt(False)
 
         try:
-            self._listener = keyboard.Listener(on_press=on_press)
+            self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
             self._listener.daemon = True
             self._listener.start()
         except Exception as exc:
             self._post_status(f"Hotkey listener failed: {exc}")
+
+    # ------------------------------------------------------------- push-to-talk
+
+    def _set_ptt(self, active: bool):
+        """Called from the listener thread when the PTT key is pressed/released."""
+        if self.engine.ptt_active == active:
+            return
+        self.engine.ptt_active = active
+        self._ui_q.put(lambda a=active: self._update_ptt_indicator(a))
+
+    def _update_ptt_indicator(self, active: bool):
+        if not self.ptt_var.get():
+            self.ptt_state_var.set("LIVE (always on)")
+            self.ptt_state_label.configure(fg="#0a0")
+            return
+        if active:
+            self.ptt_state_var.set("LIVE")
+            self.ptt_state_label.configure(fg="#0a0")
+        else:
+            self.ptt_state_var.set("muted (hold key)")
+            self.ptt_state_label.configure(fg="#888")
+
+    def _on_ptt_toggle(self):
+        self.engine.ptt_enabled = bool(self.ptt_var.get())
+        save_settings(self._settings_dict())
+        self._update_ptt_indicator(self.engine.ptt_active)
+
+    def _on_ptt_key(self, _event=None):
+        label = self.ptt_combo.get()
+        self.ptt_idx = next(
+            (i for i, (lab, _k) in enumerate(PTT_KEY_OPTIONS) if lab == label), 0
+        )
+        self._ptt_match = PTT_KEY_OPTIONS[self.ptt_idx][1]
+        self.engine.ptt_active = False  # the old key may still be physically held
+        save_settings(self._settings_dict())
+        self._post_status(f"Push-to-talk key: {label}")
+        self._update_ptt_indicator(False)
+
+    def _settings_dict(self):
+        return {
+            "ptt_enabled": bool(self.ptt_var.get()),
+            "ptt_key": PTT_KEY_OPTIONS[self.ptt_idx][0],
+        }
 
     # ------------------------------------------------------------------ status
 

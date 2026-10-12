@@ -25,6 +25,8 @@ How it works:
     path; soundboard triggers are always on. The mic gate ramps over ~10 ms
     so opening/closing never clicks. Set Discord's input mode to Voice
     Activity (not Push to Talk) so the cable stream is always transmitted.
+  - The engine auto-starts ~0.3 s after the GUI opens; the Start/Stop button
+    still toggles it at any time.
 
 Usage:
     python soundboard.py
@@ -549,6 +551,8 @@ class SoundboardApp:
         self._start_listener()
         self.refresh_files()
         self._poll_ui()
+        # Auto-start the engine a fraction of a second after the GUI is up.
+        self.root.after(300, self._start_engine)
 
     # ------------------------------------------------------------------ audio
 
@@ -813,15 +817,21 @@ class SoundboardApp:
         else:
             self.engine.sb_gain = value
 
+    def _start_engine(self):
+        """Start the engine with the currently selected devices (idempotent)."""
+        if self.engine.running:
+            return
+        for key in ("mic", "headphone", "cable"):
+            self._apply_device(key)
+        self.engine.start()
+        self.engine_btn.configure(text="Stop Engine")
+
     def _toggle_engine(self):
         if self.engine.running:
             self.engine.stop()
             self.engine_btn.configure(text="Start Engine")
         else:
-            for key in ("mic", "headphone", "cable"):
-                self._apply_device(key)
-            self.engine.start()
-            self.engine_btn.configure(text="Stop Engine")
+            self._start_engine()
 
     # ------------------------------------------------------------------ files
 

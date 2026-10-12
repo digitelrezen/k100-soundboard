@@ -1,0 +1,9 @@
+# pygame has no prebuilt wheel for Python 3.14+ (source build fails).
+# pygame-ce is a drop-in replacement that ships cp314 wheels and uses the
+# same `import pygame` API, so the app code works unchanged with either.
+pygame; python_version < "3.14"
+pygame-ce; python_version >= "3.14"
+pynput
+numpy
+sounddevice
+scipy
